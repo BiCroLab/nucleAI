@@ -15,7 +15,7 @@ Project Organization
 ├── notebooks		<- jupyter notebooks used in this project
 └── py			<- python scripts used in this project
 ```
-#List of main scripts:
+List of main scripts:
 
 ./scripts.sh		<- used to generate features and descriptors for a given cancer type
 
