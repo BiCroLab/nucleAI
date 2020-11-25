@@ -16,19 +16,14 @@ Project Organization
 └── py			<- python scripts used in this project
 ```
 List of main scripts:
-
+```bash
 ./scripts.sh		<- used to generate features and descriptors for a given cancer type
-
 ./script.intensity.sh	<- called by scripts.sh used either to generate features or descriptors
-
 ./covd2umap.sh		<- used to get the umap projection of a collection of descriptors
-
 ./py/test.covd_with_intensity_parallelOverPatches.py	   <- called by script.intensity.sh, used to get the morphological features
-
 ./py/test.mask2descriptor.py				   <- called by script.intensity.sh, used to get the descriptors
-
 ./py/test.covd_2dProjection.py				   <- called by covd2umap.sh, used to get the umap projection for a collection of descriptors
-
+```
 To run the pipeline, make sure that the raw svs files and the polygon data are located in a directory with the same structure as the original one:
 
 /media/garner1/hdd2/svs_BRCA   <- example dirpath to BRCA svs samples, with subdirectory per each sample
