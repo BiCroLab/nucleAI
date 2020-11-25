@@ -1,0 +1,887 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import numpy as np
+import sys
+import umap
+import warnings
+import networkx as nx
+from sklearn import preprocessing
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import normalize, scale
+import numba
+import igraph
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.graph_objs import *
+import plotly.express as px
+from numpy.linalg import norm
+
+from scipy.sparse import find
+from scipy import stats
+from scipy import sparse, linalg
+from scipy.sparse import coo_matrix
+import scipy.ndimage as ndi
+
+import matplotlib.pyplot as plt
+import os
+import pickle
+
+from skimage.draw import polygon
+from skimage.measure import label, regionprops#, regionprops_table
+from skimage import io
+import pyvips
+
+warnings.filterwarnings('ignore')
+
+def get_nuclear_view(imInput,maska,z):
+    masked = np.multiply(imInput[:,:,z],maska)
+    norows = masked[~np.all(masked == 0, axis=1)] #remove 0 rows
+    arr = norows[:,~(norows == 0).all(0)] # remove 0 cols
+    return arr 
+
+# get the features 
+# consider as features x,y,r,g,b,delta_x([r,g,b])+delta_y([r,g,b]),delta_xx([r,g,b])+delta_yy([r,g,b])
+def features_from_3d(arr_3d,color_dim): # color_dim is 0,1,2 for R,G,B
+    dx = np.array([[0.0,0,0.0],[-1.0,0,1.0],[0.0,0,0.0],])
+    dy = np.transpose(dx)
+    dxx = np.array([[0.0,0,0.0],[-1.0,2.0,-1.0],[0.0,0,0.0],])
+    dyy = np.transpose(dxx)
+
+    arr_2d = arr_3d[:,:,color_dim]
+    coo = coo_matrix(arr_2d)
+    
+    row = coo.row
+    col = coo.col
+        
+    delta_x = ndi.convolve(arr_2d,dx, output=np.float64, mode='nearest')
+    delta_y = ndi.convolve(arr_2d,dy, output=np.float64, mode='nearest')
+        
+    delta_xx = ndi.convolve(arr_2d,dxx, output=np.float64, mode='nearest')
+    delta_yy = ndi.convolve(arr_2d,dyy, output=np.float64, mode='nearest')
+    
+    return delta_x, delta_y, delta_xx, delta_yy
+
+def parse_polygons_in_patch(filename,frac):
+    x_list = []
+    y_list = []
+    df = pd.read_csv(filename).sample(frac=frac)
+    if ~df.empty:
+        cell_list = df['Polygon'].tolist()
+        for cell in cell_list: # loop over cells in patch                                                                                                                                                          
+            lista = list(np.fromstring(cell[1:-1], dtype=float, sep=':')) #list of vertices in polygon                                                                                                             
+            cc = lista[0::2] # list of x coord of each polygon vertex                                                                                                                                              
+            rr = lista[1::2] # list of y coord of each polygon verted                                                                                                                                              
+            poly = np.asarray(list(zip(rr,cc)))
+            mini = np.min(poly,axis=0)
+            poly -= mini # subtract the min to translate the mask                                                                                                                                                  
+
+            # create the nuclear mask                                                                                                                                                                              
+            mask = np.zeros(tuple(np.ceil(np.max(poly,axis=0) - np.min(poly,axis=0)).astype(int)))
+            rr, cc = polygon(poly[:, 0], poly[:, 1], mask.shape) # get the nonzero mask locations                                                                                                                  
+            mask[rr, cc] = 1 # nonzero pixel entries                                                                                                                                                               
+            # rescale back to original coordinates                                                                                                                                                                 
+            rr = rr.astype(float);cc = cc.astype(float)
+            rr += mini[0]; cc += mini[1]
+
+            # update the list of nonzero pixel entries                                                                                                                                                             
+            x_list.extend( [int(n) for n in list(cc)] )
+            y_list.extend( [int(n) for n in list(rr)] )
+        if len(x_list) > 0 and len(y_list) > 0:    
+            mask = make_mask_from_polygons(filename,x_list,y_list)
+            return mask
+
+def tile_from_svs(svs_filename,mask,x,y):
+    
+    format_to_dtype = {
+    'uchar': np.uint8,
+    'char': np.int8,
+    'ushort': np.uint16,
+    'short': np.int16,
+    'uint': np.uint32,
+    'int': np.int32,
+    'float': np.float32,
+    'double': np.float64,
+    'complex': np.complex64,
+    'dpcomplex': np.complex128,
+    }
+    
+    image = pyvips.Image.new_from_file(svs_filename)[0:3] # drop alpha channel
+    tile = image.crop(x,y,mask.shape[1],mask.shape[0])
+    np_3d = np.ndarray(buffer=tile.write_to_memory(),
+                       dtype=format_to_dtype[tile.format],
+                       shape=[tile.height, tile.width, tile.bands])
+    
+    #print(tile.height, tile.width, tile.bands, tile.format, tile.interpretation)
+    #tile.write_to_file(svs_filename+'.'+str(x)+'.'+str(y)+'.jpg[Q=100]') # save as jpg file
+    return np_3d
+
+def covd_rgb(l,labels,imInput,regions,x,y):
+    maska = labels == l # get the mask
+    if maska.nonzero()[0].shape[0] > 100: # condition on mask size to remove small nuclei
+        # Repeat over the third axis of the image
+        arr0 = get_nuclear_view(imInput,maska,0)
+        arr1 = get_nuclear_view(imInput,maska,1)
+        arr2 = get_nuclear_view(imInput,maska,2)
+
+        # Arrays can have different sizes and they need to be normalized
+        minshape = min(i.shape for i in [arr0,arr1,arr2])
+        print([i.shape for i in [arr0,arr1,arr2]], minshape)
+        arr00 = np.copy(arr0[:minshape[0],:minshape[1]])
+        arr11 = np.copy(arr1[:minshape[0],:minshape[1]])
+        arr22 = np.copy(arr2[:minshape[0],:minshape[1]])
+        print([i.shape for i in [arr00,arr11,arr22]],minshape)
+        arr_3d = np.dstack((arr00, arr11, arr22))
+                
+                #plt.figure()
+                #plt.imshow(arr_3d)
+                #plt.savefig('./nucleus_'+str(l)+'.png')
+                
+        # get the features
+        delta_x_R, delta_y_R, delta_xx_R, delta_yy_R = features_from_3d(arr_3d,0)
+        delta_x_G, delta_y_G, delta_xx_G, delta_yy_G = features_from_3d(arr_3d,1)
+        delta_x_B, delta_y_B, delta_xx_B, delta_yy_B = features_from_3d(arr_3d,2)
+
+        delta_x = np.zeros((arr_3d.shape[0],arr_3d.shape[1]))
+        delta_xx = np.zeros((arr_3d.shape[0],arr_3d.shape[1]))
+        delta_y = np.zeros((arr_3d.shape[0],arr_3d.shape[1]))
+        delta_yy = np.zeros((arr_3d.shape[0],arr_3d.shape[1]))
+        for r in range(arr_3d.shape[0]):
+            for c in range(arr_3d.shape[1]):
+                delta_x[r,c] = np.sqrt(delta_x_R[r,c]**2+delta_x_G[r,c]**2+delta_x_B[r,c]**2)
+                delta_xx[r,c] = np.sqrt(delta_xx_R[r,c]**2+delta_xx_G[r,c]**2+delta_xx_B[r,c]**2)
+                delta_y[r,c] = np.sqrt(delta_y_R[r,c]**2+delta_y_G[r,c]**2+delta_y_B[r,c]**2)
+                delta_yy[r,c] = np.sqrt(delta_yy_R[r,c]**2+delta_yy_G[r,c]**2+delta_yy_B[r,c]**2)
+
+        feature_data = np.zeros((arr_3d.shape[0]*arr_3d.shape[1],9))
+        idx = 0
+        for r in range(arr_3d.shape[0]):
+            for c in range(arr_3d.shape[1]):
+                    feature_data[idx,:] = np.hstack((r,c,
+                                                    arr_3d[r,c,0],arr_3d[r,c,1],arr_3d[r,c,2],
+                                                    delta_x[r,c],delta_y[r,c],
+                                                    delta_xx[r,c],delta_yy[r,c]))
+                    idx += 1
+                    
+        cx = regions[l-1].centroid[0] + np.float(x) # -1 because the list of regions is 0-based
+        cy = regions[l-1].centroid[1] + np.float(y) # -1 because the list of regions is 0-based
+        return tuple((cx,cy)),feature_data 
+    else:
+        return None, None
+
+def process_patch(patch,frac,svs_filename): # process a given fraction of nuclei in the patch
+    patch_name = patch.split('/')[9:]
+    if not pd.read_csv(patch).empty: 
+        #print('The patch is not empty',patch_name[0])
+        x = patch_name[0].split('_')[0]
+        y = patch_name[0].split('_')[1]
+        #print(x,y)
+        #plt.imshow(imInput)
+        mask = parse_polygons_in_patch(patch,frac)
+        if mask is not None:
+            labels, num = label(mask, return_num=True, connectivity=1) # connectivity has to be 1 otherwise different mask are placed together
+            regions = regionprops(labels)
+            
+            imInput = tile_from_svs(svs_filename,mask,x,y)
+        
+            label_id = [r.label for r in regions if r.label is not None]
+            generated_covds = []
+            for l in label_id:
+                nuc_pos, nuc_featureData = covd_rgb(l,labels,imInput,regions,x,y)
+                if nuc_pos is not None:
+                    generated_covds.append(tuple((nuc_pos,nuc_featureData)))
+                
+            filename = patch+'.pkl' # name of the intensity features output file
+            outfile = open(filename,'wb')
+            pickle.dump(generated_covds,outfile)
+            outfile.close()
+            return
+
+def process_patch_with_intensity(patch,frac,svs_filename): # process a given fraction of nuclei in the patch
+    #print(os.path.basename(patch))
+    patch_name = os.path.basename(patch)
+    features = ['cx','cy','area','eccentricity','orientation','perimeter','solidity','intensity_R','intensity_G','intensity_B']
+    if not pd.read_csv(patch).empty: 
+        x = patch_name.split('_')[0]
+        y = patch_name.split('_')[1]
+        # plt.imshow(imInput)
+        mask = parse_polygons_in_patch(patch,frac)
+        if mask is not None:
+            labels, num = label(mask, return_num=True, connectivity=1) # connectivity has to be 1 
+            imInput = tile_from_svs(svs_filename,mask,x,y)
+            try:
+                regions = regionprops(labels)
+                morphometry = [(n.centroid[1]+float(x),n.centroid[0]+float(y),n.area,n.eccentricity,n.orientation,n.perimeter,n.solidity) for n in regions]
+                regions_R = regionprops(labels,intensity_image=imInput[:,:,0])
+                regions_G = regionprops(labels,intensity_image=imInput[:,:,1])
+                regions_B = regionprops(labels,intensity_image=imInput[:,:,2])
+                intensity_R = [np.sum(n.intensity_image) for n in regions_R]
+                intensity_G = [np.sum(n.intensity_image) for n in regions_G]
+                intensity_B = [np.sum(n.intensity_image) for n in regions_B]
+                
+            except ValueError:  #raised if array is empty.
+                pass
+            df = pd.DataFrame(morphometry, columns =['cx','cy','area','eccentricity','orientation','perimeter','solidity'])
+            df['intensity_R'] = intensity_R
+            df['intensity_G'] = intensity_G
+            df['intensity_B'] = intensity_B
+
+            filename = patch+'.pkl' # name of the intensity features output file
+            df.to_pickle(filename) # store output as a pkl file
+    return
+
+def process_patch_wo_intensity(patch,frac): # process a given fraction of nuclei in the patch
+    #print(os.path.basename(patch))
+    patch_name = os.path.basename(patch)
+    features = ['cx','cy','area','eccentricity','orientation','perimeter','solidity']
+    if not pd.read_csv(patch).empty: 
+        x = patch_name.split('_')[0]
+        y = patch_name.split('_')[1]
+        # plt.imshow(imInput)
+        mask = parse_polygons_in_patch(patch,frac)
+        if mask is not None:
+            labels, num = label(mask, return_num=True, connectivity=1) # connectivity has to be 1 
+            try:
+                regions = regionprops(labels)
+                morphometry = [(n.centroid[1]+float(x),n.centroid[0]+float(y),n.area,n.eccentricity,n.orientation,n.perimeter,n.solidity) for n in regions]
+                
+            except ValueError:  #raised if array is empty.
+                pass
+            df = pd.DataFrame(morphometry, columns =['cx','cy','area','eccentricity','orientation','perimeter','solidity'])
+
+            filename = patch+'.pkl' # name of the intensity features output file
+            df.to_pickle(filename)
+    return
+
+def make_mask_from_polygons(filename,x_list,y_list):
+    if not (x_list and y_list):
+        pass
+    else:
+        xx = np.array(x_list).reshape((len(x_list),1))
+        yy = np.array(y_list).reshape((len(y_list),1))
+
+        arr = np.hstack((xx,yy))
+
+        # subtract the min to translate the mask                                                                                                                                                                   
+        mini = np.min(arr,axis=0); arr -= mini
+
+        rr = np.rint(arr[:,1]).astype(int) # xs are cols                                                                                                                                                           
+        cc = np.rint(arr[:,0]).astype(int) # ys are rows                                                                                                                                                           
+        mtx = coo_matrix((np.ones(rr.shape), (rr, cc)), dtype=bool)
+        
+        #plt.figure(figsize=(40,40))
+        #io.imshow(mtx.todense(),cmap='gray')
+        #plt.savefig(filename+'.png')
+        return mtx.todense()
+
+def scattered2d_tcga(df,filename):
+    fig = px.scatter(df,
+                     x="x", y="y",
+                     color="label",
+                     hover_name='sample',
+                     color_discrete_sequence=px.colors.qualitative.Plotly
+    )
+    fig.update_traces(marker=dict(size=2,opacity=1.0))
+    fig.update_layout(template='simple_white')
+    fig.update_layout(legend= {'itemsizing': 'constant'})
+    fig.write_image(filename+'.tcga.pdf', format='pdf')
+    return
+
+def scattered3d_tcga(df,filename):
+    fig = px.scatter_3d(df,
+                        x="x", y="y", z="z",
+                        color="label",
+                        hover_name='sample',
+                        color_discrete_sequence=px.colors.qualitative.Plotly
+    )
+    fig.update_traces(marker=dict(size=2,opacity=1.0))
+    fig.update_layout(template='simple_white')
+    fig.update_layout(legend= {'itemsizing': 'constant'})
+    fig.write_html(filename+'.tcga.html', auto_open=False)
+    return
+
+# Return the barycenter of the covd for a given sample
+def load_barycenters(sample, descriptor_name):
+    df = pd.read_pickle(sample)
+    barycenter = df[descriptor_name].mean()
+    return barycenter
+
+# Given the nonzero pixel values show the mask
+def show_patch_from_polygon(filename,x_list,y_list):
+    if not (x_list and y_list):
+        pass
+    else:
+        xx = np.array(x_list).reshape((len(x_list),1))
+        yy = np.array(y_list).reshape((len(y_list),1))
+        
+        arr = np.hstack((xx,yy))
+
+        # subtract the min to translate the mask 
+        mini = np.min(arr,axis=0); arr -= mini
+
+        rr = np.rint(arr[:,1]).astype(int) # xs are cols
+        cc = np.rint(arr[:,0]).astype(int) # ys are rows
+        mtx = coo_matrix((np.ones(rr.shape), (rr, cc)), dtype=bool)
+
+        plt.figure(figsize=(40,40))
+        io.imshow(mtx.todense(),cmap='gray')
+        plt.savefig(filename+'.png')
+    return
+
+# Given a list of patches of segmented nuclei in polygon format, show the masks
+def show_patches_parallel(filename):
+    x_list = []
+    y_list = []
+    df = pd.read_csv(filename)
+    if ~df.empty:
+        cell_list = df['Polygon'].tolist()
+        for cell in cell_list: # loop over cells in patch
+            lista = list(np.fromstring(cell[1:-1], dtype=float, sep=':')) #list of vertices in polygon
+            cc = lista[0::2] # list of x coord of each polygon vertex
+            rr = lista[1::2] # list of y coord of each polygon verted
+            poly = np.asarray(list(zip(rr,cc)))
+            mini = np.min(poly,axis=0)
+            poly -= mini # subtract the min to translate the mask 
+            
+            # create the nuclear mask
+            mask = np.zeros(tuple(np.ceil(np.max(poly,axis=0) - np.min(poly,axis=0)).astype(int))) 
+            rr, cc = polygon(poly[:, 0], poly[:, 1], mask.shape) # get the nonzero mask locations
+            mask[rr, cc] = 1 # nonzero pixel entries
+            # rescale back to original coordinates
+            rr = rr.astype(float);cc = cc.astype(float)
+            rr += mini[0]; cc += mini[1]
+            
+            # update the list of nonzero pixel entries
+            x_list.extend( [int(n) for n in list(cc)] ) 
+            y_list.extend( [int(n) for n in list(rr)] )
+        show_patch_from_polygon(filename,x_list,y_list)
+    return
+
+def measure_patch_of_polygons(filename,features,outdir): 
+    # given the patch filename containing the polygon coordinates, generate morphometrics
+    # Polygons are encoded in cartesian coord system (x,y) with the origin at the top-left corner
+    # the first 2 integers in the polygon filename give the (x,y) coord of the top-left corner of the patch
+    # remember that skimage and numpy use the array convention of (row,col) for coordinates
+    data = pd.DataFrame(columns = features) # create empty df to store morphometrics
+    df = pd.read_csv(filename)
+    nuclei_list = df['Polygon'].tolist()
+    #print('There are '+str(len(nuclei_list))+' nuclei in this fov')
+    for cell in nuclei_list: # loop over cells in patch
+        lista = list(np.fromstring(cell[1:-1], dtype=float, sep=':')) #list of vertices in polygon
+        cc = lista[0::2] # list of x coord of each polygon vertex are the columns of a numpy array
+        rr = lista[1::2] # list of y coord of each polygon verted are the rows of a numpy array
+        poly = np.asarray(list(zip(rr,cc)))
+        
+        # shift by the min
+        mini = np.min(poly,axis=0)
+        poly -= mini 
+        
+        # create the nuclear mask
+        mask = np.zeros(tuple(np.ceil(np.max(poly,axis=0) - np.min(poly,axis=0)).astype(int))) # build an empty mask spanning the support of the polygon
+        rr, cc = polygon(poly[:, 0], poly[:, 1], mask.shape) # get the nonzero mask locations
+        mask[rr, cc] = 1 # nonzero pixel entries
+        label_mask = label(mask,connectivity=1) # connectivity has to be 1 otherwise there will be masks from diff nuclei touching on the diagonals
+        
+        # calculate morphometrics
+        dicts = {}
+        keys = features         
+        try:
+            regions = regionprops(label_mask, coordinates='rc')       
+            if len(regions) > 0:
+                for i in keys:  # loop over features
+                    if i == 'cx':
+                        dicts[i] = np.rint(regions[0]['centroid'][1]+mini[1]).astype(int) # x-coord is column
+                    elif i == 'cy':
+                        dicts[i] = np.rint(regions[0]['centroid'][0]+mini[0]).astype(int) # y-coord is row
+                    else:
+                        dicts[i] = regions[0][i]
+        except ValueError:  #raised if array is empty.
+            pass
+        
+        # update morphometrics data 
+        new_df = pd.DataFrame(dicts, index=[0])
+        data = data.append(new_df, ignore_index=True)
+    data.to_pickle(outdir+'/'+os.path.basename(filename)+'.morphometrics.connectivity_1.pkl')
+    return 
+
+# Plotly contour visualization
+def plotlyContourPlot(fdf,filename):
+    # define the pivot tabel for the contour plot
+    table = pd.pivot_table(fdf, 
+                           values='field', 
+                           index=['x_bin'],
+                           columns=['y_bin'],
+                           aggfunc=np.sum, # take the mean of the entries in the bin
+                           fill_value=None)
+    
+    fig = go.Figure(data=[go.Surface(z=table.values,
+                                     x=table.columns.values, 
+                                     y=table.index.values,
+                                     colorscale='Jet')])
+    fig.update_traces(contours_z=dict(show=True, usecolormap=True,
+                                  highlightcolor="limegreen", project_z=True))
+    fig.update_layout(title=filename, autosize=True,
+                      scene_camera_eye=dict(x=1.87, y=0.88, z=-0.64),
+                      width=1000, height=1000,
+                      margin=dict(l=65, r=50, b=65, t=90)
+                    )
+    fig.show()
+    return
+
+def contourPlot(fdf,feature,N,aggfunc,levels,cmap,filename): # Contour visualization
+    ratio = fdf.max()[0]/fdf.max()[1] # ratio of max x and y centroids coordinates
+    Nx = int(round(ratio*N))
+    fdf['x_bin'] = pd.cut(fdf['centroid_x'], Nx, labels=False) # define the x bin label
+    fdf['y_bin'] = pd.cut(fdf['centroid_y'], N, labels=False) # define the y bin label
+
+    # define the pivot tabel for the contour plot
+    table = pd.pivot_table(fdf, 
+                           values=feature, 
+                           index=['x_bin'],
+                           columns=['y_bin'],
+                           aggfunc=aggfunc, # take the mean or another function of the entries in the bin
+                           fill_value=None)
+    X=table.columns.values
+    Y=table.index.values
+    Z=table.values
+    Xi,Yi = np.meshgrid(X, Y)
+
+    fig, ax = plt.subplots(figsize=(ratio*10,10))
+    cs = ax.contourf(Yi, Xi, Z, 
+                     alpha=1.0, 
+                     levels=levels,
+                     cmap=cmap);
+    ax.invert_yaxis()
+    cbar = fig.colorbar(cs)
+    plt.savefig(filename+'.contour.png')
+    plt.title(os.path.basename(filename))
+    plt.show()
+    plt.close()
+    
+def get_fov(df,row,col):
+    fdf = df[(df['fov_row']==row) & (df['fov_col']==col)]
+    pos = fdf[fdf.columns[2:4]].to_numpy() # Get the positions of centroids 
+
+    # Building the UMAP graph
+    print('Creating the graph')
+    nn = fdf.shape[0]//25 #set the number of nn
+    print('The connectivity is '+str(nn))
+    A = space2graph(pos,nn)
+    
+    print('Creating the network')
+    G = nx.from_scipy_sparse_matrix(A, edge_attribute='weight')
+    
+    #get the morphological data and rescale the data by std 
+    data = scale(fdf[features].to_numpy(), with_mean=False) 
+
+    print('Generating the descriptor')
+    num_cores = multiprocessing.cpu_count() # numb of cores
+    row_idx, col_idx, values = find(A) #A.nonzero() # nonzero entries
+    processed_list = Parallel(n_jobs=num_cores)(delayed(covd_local)(r,data,row_idx,col_idx) 
+                                                                for r in range(A.shape[0])
+                                                       )
+
+    # Construct the descriptor array
+    descriptor = np.zeros((len(processed_list),processed_list[0][1].shape[0]))
+    for r in range(len(processed_list)):
+        descriptor[r,:] = processed_list[r][1] # covd descriptors of the connected nodes
+    
+    print('Generating the field')
+    #fdf['field'] = covd_gradient(descriptor,row_idx,col_idx,values)
+    fdf['field'] = Parallel(n_jobs=num_cores)(delayed(covd_gradient_parallel)(node,descriptor,row_idx,col_idx,values) 
+                                                                for node in range(A.shape[0])
+                                                       )
+    print('Done')
+    return fdf
+
+
+def covd_parallel(node,data):
+    mat = data[node,:,:].copy()
+
+    # rescaled_xy = stats.zscore(mat[:,:2]) # rescale position locally by mean and std
+    # mat[:,:2] = rescaled_xy # update positions
+    # C = np.cov(mat,rowvar=False)
+
+    C = np.corrcoef(mat,rowvar=False)
+
+    # gamma = 1.0e-08 # regularization parameter
+    # C += gamma*np.identity(C.shape[0]) # diagonal loading to regularize the covariance matrix
+
+    covd_ok = 1 # boolean switch to signal if covd is defined or not
+    entropy = np.nan
+    try:
+        L = linalg.logm(C)
+        Lr = np.real_if_close(L) # remove small imaginary parts
+        iu1 = np.triu_indices(Lr.shape[1])
+        vec = Lr[iu1]
+
+        # -Tr(C/d*Log(C/d)) =-Tr(C*Log(C))/d - Tr(C*log(d))/d = -Tr(C*Log(C))/d - Dim*log(d)/d
+        d = np.trace(C)
+        entropy = -1.0*( np.trace(np.dot(C,Lr)) - C.shape[0]*np.log(d) )/d
+        
+        return (node,vec,covd_ok,entropy)
+    except Exception:
+        covd_ok -= 1
+        iu1 = np.triu_indices(C.shape[1])
+        vec = 0.0*C[iu1]
+        return (node,vec,covd_ok,entropy)
+    return
+
+def covd_parallel_with_intensity(node,data):
+    mat = data[node,:,:].copy()
+    mat_with_intensity = mat; mat_wo_intensity = mat[:,np.r_[0:7,-1]].copy()
+    C_with_intensity = np.corrcoef(mat_with_intensity,rowvar=False); C_wo_intensity = np.corrcoef(mat_wo_intensity,rowvar=False)
+    try:
+        L_with_intensity = linalg.logm(C_with_intensity); L_wo_intensity = linalg.logm(C_wo_intensity)
+        Lr_with_intensity = np.real_if_close(L_with_intensity); Lr_wo_intensity = np.real_if_close(L_wo_intensity)
+        iu1_with_intensity = np.triu_indices(Lr_with_intensity.shape[1]); iu1_wo_intensity = np.triu_indices(Lr_wo_intensity.shape[1])
+        vec_with_intensity = Lr_with_intensity[iu1_with_intensity]; vec_wo_intensity = Lr_wo_intensity[iu1_wo_intensity]
+        return (node,vec_with_intensity,vec_wo_intensity)
+    except Exception:
+        return (node,None,None)
+  
+def covd_parallel_sparse(node,data,nn_idx):
+    mat = data[nn_idx[node,:],:]
+    C = np.corrcoef(mat.astype(float),rowvar=False) # compute correlation matrix to account for std
+    gamma = 1.0e-08 # regularization parameter
+    C += gamma*np.identity(C.shape[0]) # diagonal loading to regularize the covariance matrix
+    problematic_nodes_switch = 1
+    centroid = data[node,:2]
+    try:
+        L = linalg.logm(C)
+        Lr = np.real_if_close(L) # remove small imaginary parts
+        iu1 = np.triu_indices(Lr.shape[1])
+        vec = Lr[iu1]
+        return (node,vec,problematic_nodes_switch,centroid)
+    except Exception:
+        problematic_nodes_switch -= 1
+        iu1 = np.triu_indices(C.shape[1])
+        vec = 0.0*C[iu1]
+        return (node,vec,problematic_nodes_switch,centroid)
+
+    
+def filtering_HE(df):
+    #First removing columns
+    filt_df = df[df.columns[7:]]
+    df_keep = df.drop(df.columns[7:], axis=1)
+    #Then, computing percentiles
+    low = .01
+    high = .99
+    quant_df = filt_df.quantile([low, high])
+    #Next filtering values based on computed percentiles
+    filt_df = filt_df.apply(lambda x: x[(x>quant_df.loc[low,x.name]) & 
+                                        (x < quant_df.loc[high,x.name])], axis=0)
+    #Bringing the columns back
+    filt_df = pd.concat( [df_keep,filt_df], axis=1 )
+    #rows with NaN values can be dropped simply like this
+    filt_df.dropna(inplace=True)
+    return filt_df
+
+def filtering(df):
+    #First removing columns
+    filt_df = df[["area","perimeter","solidity","eccentricity","circularity","mean_intensity","std_intensity"]]
+    df_keep = df.drop(["area","perimeter","solidity","eccentricity","circularity","mean_intensity","std_intensity"], axis=1)
+    #Then, computing percentiles
+    low = .01
+    high = .99
+    quant_df = filt_df.quantile([low, high])
+    #Next filtering values based on computed percentiles
+    filt_df = filt_df.apply(lambda x: x[(x>quant_df.loc[low,x.name]) & 
+                                        (x < quant_df.loc[high,x.name])], axis=0)
+    #Bringing the columns back
+    filt_df = pd.concat( [df_keep,filt_df], axis=1 )
+    filt_df['cov_intensity'] = filt_df['std_intensity']/filt_df['mean_intensity']
+    #rows with NaN values can be dropped simply like this
+    filt_df.dropna(inplace=True)
+    return filt_df
+
+def space2graph(positions,nn):
+    XY = positions#np.loadtxt(filename, delimiter="\t",skiprows=True,usecols=(5,6))
+    mat_XY = umap.umap_.fuzzy_simplicial_set(
+        XY,
+        n_neighbors=nn, 
+        random_state=np.random.RandomState(seed=42),
+        metric='l2',
+        metric_kwds={},
+        knn_indices=None,
+        knn_dists=None,
+        angular=False,
+        set_op_mix_ratio=1.0,
+        local_connectivity=2.0,
+        verbose=False
+    )
+    return mat_XY
+
+def getdegree(graph):
+    d = np.asarray(graph.degree(weight='weight'))[:,1] # as a (N,) array
+    r = d.shape[0]
+    return d.reshape((r,1))
+
+def clusteringCoeff(A):
+    AA = A.dot(A)
+    AAA = A.dot(AA)  
+    d1 = AA.mean(axis=0) 
+    m = A.mean(axis=0)
+    d2 = np.power(m,2)
+    num = AAA.diagonal().reshape((1,A.shape[0]))
+    denom = np.asarray(d1-d2)
+    cc = np.divide(num,denom*A.shape[0]) #clustering coefficient
+    r, c = cc.shape
+    return cc.reshape((c,r))
+
+def rescale(data):
+    newdata = preprocessing.minmax_scale(data,feature_range=(-1, 1),axis=0) # rescale data so that each feature ranges in [0,1]
+    return newdata
+
+def smoothing(W,data,radius):
+    S = normalize(W, norm='l1', axis=1) #create the row-stochastic matrix
+
+    smooth = np.zeros((data.shape[0],data.shape[1]))
+    summa = data
+    for counter in range(radius):
+        newdata = S.dot(data)
+        summa += newdata
+        data = newdata
+        if counter == radius-1:
+            smooth = summa*1.0/(counter+1)
+    return smooth
+
+def covd(mat):
+    ims = coo_matrix(mat)                               # make it sparse
+    imd = np.pad( mat.astype(float), (1,1), 'constant') # path with zeros
+
+    [x,y,I] = [ims.row,ims.col,ims.data]                # get position and intensity
+    pos = np.asarray(list(zip(x,y)))                    # define position vector
+    length = np.linalg.norm(pos,axis=1)                 # get the length of the position vectors
+    
+    Ix = []  # first derivative in x
+    Iy = []  # first derivative in y
+    Ixx = [] # second der in x
+    Iyy = [] # second der in y 
+    Id = []  # magnitude of the first der 
+    Idd = [] # magnitude of the second der
+    
+    for ind in range(len(I)):
+        Ix.append( 0.5*(imd[x[ind]+1,y[ind]] - imd[x[ind]-1,y[ind]]) )
+        Ixx.append( imd[x[ind]+1,y[ind]] - 2*imd[x[ind],y[ind]] + imd[x[ind]-1,y[ind]] )
+        Iy.append( 0.5*(imd[x[ind],y[ind]+1] - imd[x[ind],y[ind]-1]) )
+        Iyy.append( imd[x[ind],y[ind]+1] - 2*imd[x[ind],y[ind]] + imd[x[ind],y[ind]-1] )
+        Id.append(np.linalg.norm([Ix,Iy]))
+        Idd.append(np.linalg.norm([Ixx,Iyy]))
+    #descriptor = np.array( list(zip(list(x),list(y),list(I),Ix,Iy,Ixx,Iyy,Id,Idd)),dtype='int64' ).T # descriptor
+    descriptor = np.array( list(zip(list(length),list(I),Ix,Iy,Ixx,Iyy,Id,Idd)),dtype='int64' ).T     # rotationally invariant descriptor 
+    C = np.cov(descriptor)            # covariance of the descriptor
+    iu1 = np.triu_indices(C.shape[1]) # the indices of the upper triangular part
+    covd2vec = C[iu1]
+    return covd2vec
+
+
+def covd_old(features,G,threshold,quantiles,node_color):
+    L = nx.laplacian_matrix(G)
+    delta_features = L.dot(features)
+    data = np.hstack((features,delta_features)) #it has 16 features
+
+    covdata = [] # will contain a list for each quantile
+    graph2covd = []
+    for q in range(quantiles):
+        covq = [] # will contain a covmat for each connected subgraph
+        nodes = [n for n in np.where(node_color == q)[0]]
+        subG = G.subgraph(nodes)
+        graphs = [g for g in list(nx.connected_component_subgraphs(subG)) if g.number_of_nodes()>=threshold] # threshold graphs based on their size
+        print('The number of connected components is',str(nx.number_connected_components(subG)), ' with ',str(len(graphs)),' large enough')
+        g_id = 0
+        for g in graphs:
+            nodeset = list(g.nodes)
+            dataset = data[nodeset]
+            covmat = np.cov(dataset,rowvar=False)
+            covq.append(covmat)
+
+            quant_graph = list([(q,g_id)])
+            tuple_nodes = [tuple(g.nodes)]
+            new_graph2covd = list(zip(quant_graph,tuple_nodes))
+            graph2covd.append(new_graph2covd)
+            g_id += 1
+        covdata.append(covq)
+
+    return covdata, graph2covd
+
+def get_subgraphs(G,threshold,quantiles,node_quantiles):
+    subgraphs = []
+    node_set = []
+    for f in range(node_quantiles.shape[1]): # for every feature
+        for q in range(quantiles):        # for every quantile
+            nodes = [n for n in np.where(node_quantiles[:,f] == q)[0]] #get the nodes
+            subG = G.subgraph(nodes) # build the subgraph
+            graphs = [g for g in list(nx.connected_component_subgraphs(subG)) if g.number_of_nodes()>=threshold] # threshold connected components in subG based on their size
+            subgraphs.extend(graphs)
+
+            node_subset = [list(g.nodes) for g in graphs]
+            node_set.extend(node_subset)    
+    unique_nodes = list(np.unique(np.asarray([node for sublist in node_set for node in sublist])))    
+            
+    return subgraphs, unique_nodes
+
+def covd_multifeature(features,G,subgraphs):
+    L = nx.laplacian_matrix(G)
+    delta_features = L.dot(features)
+    data = np.hstack((features,delta_features)) #it has 16 features
+
+    covdata = [] # will contain a list for each quantile
+    graph2covd = []
+
+    for g in subgraphs:
+        nodeset = list(g.nodes)
+        dataset = data[nodeset]
+        covmat = np.cov(dataset,rowvar=False)
+        covdata.append(covmat)
+
+        graph2covd.append(list(g.nodes))
+            
+    return covdata, graph2covd
+
+def community_covd(features,G,subgraphs):
+    L = nx.laplacian_matrix(G)
+    delta_features = L.dot(features)
+    data = np.hstack((features,delta_features)) #it has 16 features
+
+    covdata = [] # will contain a list for each community
+    
+    for g in subgraphs:
+        nodes = [int(n) for n in g]
+        dataset = data[nodes]
+        covmat = np.cov(dataset,rowvar=False)
+        covdata.append(covmat)
+        
+    return covdata
+
+def community_covd_woLaplacian(features,G,subgraphs):
+    data = features
+
+    covdata = [] # will contain a list for each community
+    
+    for g in subgraphs:
+        nodes = [int(n) for n in g]
+        dataset = data[nodes]
+        covmat = np.cov(dataset,rowvar=False)
+        covdata.append(covmat)
+        
+    return covdata
+
+def logdet_div(X,Y): #logdet divergence
+    (sign_1, logdet_1) = np.linalg.slogdet(0.5*(X+Y)) 
+    (sign_2, logdet_2) = np.linalg.slogdet(np.dot(X,Y))
+    return np.sqrt( sign_1*logdet_1-0.5*sign_2*logdet_2 )
+
+def airm(X,Y): #affine invariant riemannian metric
+    A = np.linalg.inv(linalg.sqrtm(X))
+    B = np.dot(A,np.dot(Y,A))
+    return np.linalg.norm(linalg.logm(B))
+
+def cluster_morphology(morphology,graph2covd,labels):
+    nodes_in_cluster = []
+    numb_of_clusters = len(set(labels))
+    cluster_mean = np.zeros((numb_of_clusters,morphology.shape[1]))
+    if -1 in set(labels):
+        for cluster in set(labels):
+            nodes_in_cluster.extend([graph2covd[ind] for ind in range(len(graph2covd)) if labels[ind] == cluster ])
+            nodes = [item for sublist in nodes_in_cluster for item in sublist]
+            ind = int(cluster)+1
+            cluster_mean[ind,:] = np.mean(morphology[nodes,:],axis=0)
+    else:
+        for cluster in set(labels):
+            nodes_in_cluster.extend([graph2covd[ind] for ind in range(len(graph2covd)) if labels[ind] == cluster ])
+            nodes = [item for sublist in nodes_in_cluster for item in sublist]
+            cluster_mean[cluster,:] = np.mean(morphology[nodes,:],axis=0)
+    return cluster_mean
+
+def networkx2igraph(graph,nodes,edges):     # given a networkx graph creates an igraph object
+    g = igraph.Graph(directed=False)
+    g.add_vertices(nodes)
+    g.add_edges(edges)
+    edgelist = nx.to_pandas_edgelist(graph)
+    for attr in edgelist.columns[2:]:
+        g.es[attr] = edgelist[attr]
+    return g
+
+# # Show the log-log plot of the edge heterogeneity
+# def plot_loglog(df,title):
+#     values, bins = np.histogram(df['diversity'],bins=1000)
+#     y = values
+#     x = [0.5*(bins[i]+bins[i+1]) for i in range(len(bins)-1)]
+
+#     plt.loglog(x, y,'r.')
+#     plt.xlabel("edge heterogeneity", fontsize=14)
+#     plt.ylabel("counts", fontsize=14)
+#     plt.title(title)
+#     plt.savefig(title+'.edgeH.loglog.png')
+#     plt.close()
+#     #plt.show()
+#     return
+
+# # Show the lognormal distribution of the node heterogeneity
+# def plot_lognormal(df,title):
+#     values, bins = np.histogram(np.log2(df['diversity']),bins=100) # take the hist of the log values
+#     y = values
+#     x = [0.5*(bins[i]+bins[i+1]) for i in range(len(bins)-1)]
+
+#     plt.plot(x, y,'r.')
+#     plt.xscale('linear')
+#     plt.yscale('linear')
+#     plt.xlabel("Log_2 node heterogeneity", fontsize=14)
+#     plt.ylabel("counts", fontsize=14)
+#     plt.title(title)
+#     plt.savefig(title+'.nodeH.lognorm.png')
+#     plt.close()
+#     #plt.show()
+#     return
+
+# def edge_diversity_parallel(node,neightbors,diversity,fdf):
+#     edge = []
+#     node_arr = fdf.loc[node,['centroid_x','centroid_y']].to_numpy()
+#     nn_arr = fdf.loc[neightbors,['centroid_x','centroid_y']].to_numpy()
+#     centroid = 0.5*(node_arr+nn_arr)
+#     array = np.hstack((centroid,diversity.reshape((diversity.shape[1],1))))
+#     edge.extend(array.tolist())
+#     return edge
+
+# def covd_gradient_parallel(node,descriptor,row_idx,col_idx,values):
+#     mask = row_idx == node         # find nearest neigthbors
+#     delta = norm(descriptor[node,:]-descriptor[col_idx[mask],:],axis=1) # broadcasting to get change at edges
+#     delta = np.reshape(delta,(1,delta.shape[0]))
+#     # if you consider graph weights in computing the diversity
+#     weights = values[mask]    
+#     return (node, col_idx[mask], delta, weights)
+
+# def covd(data,row_idx,col_idx,values):
+#     global_gradient = []
+#     for node in range(data.shape[0]):
+#         mat = data[nn_idx[node,:],:]
+#         C = np.corrcoef(mat.astype(float),rowvar=False) # compute correlation matrix to account for std
+#         gamma = 1.0e-08 # regularization parameter
+#         C += gamma*np.identity(C.shape[0]) # diagonal loading to regularize the covariance matrix
+#         problematic_nodes_switch = 1
+#         centroid = data[node,:2]
+#         try:
+#             L = linalg.logm(C)
+#             Lr = np.real_if_close(L) # remove small imaginary parts
+#             iu1 = np.triu_indices(Lr.shape[1])
+#             vec = Lr[iu1]
+#             return (node,vec,problematic_nodes_switch,centroid)
+#         except Exception:
+#             problematic_nodes_switch -= 1
+#             iu1 = np.triu_indices(C.shape[1])
+#             vec = 0.0*C[iu1]
+#             return (node,vec,problematic_nodes_switch,centroid)
+
+#         global_gradient.append(gradient)
+#     return global_gradient
+
+
+# def covd_parallel(node,data,row_idx,col_idx): # returns the vec of the logarithm of the cov matrix
+#     mask = row_idx == node         # find nearest neigthbors
+#     cluster = np.append(node,col_idx[mask]) # define the local cluster, its size depends on the local connectivity
+#     C = np.corrcoef(data[cluster,:],rowvar=False)
+#     L = linalg.logm(C) 
+#     iu1 = np.triu_indices(L.shape[1])
+#     vec = L[iu1]
+#     return (node,vec)
