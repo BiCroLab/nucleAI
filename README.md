@@ -5,6 +5,7 @@ machine learning on WSI
 
 Project Organization
 ------------
+```bash
 .
 ├── data
 │   ├── covds		<- temporary dir storing covariance descriptors per sample
@@ -13,14 +14,19 @@ Project Organization
 ├── models		<- Trained and serialized models, model predictions, or model summaries
 ├── notebooks		<- jupyter notebooks used in this project
 └── py			<- python scripts used in this project
-
-List of main scripts:
+```
+#List of main scripts:
 
 ./scripts.sh		<- used to generate features and descriptors for a given cancer type
+
 ./script.intensity.sh	<- called by scripts.sh used either to generate features or descriptors
+
 ./covd2umap.sh		<- used to get the umap projection of a collection of descriptors
+
 ./py/test.covd_with_intensity_parallelOverPatches.py	   <- called by script.intensity.sh, used to get the morphological features
+
 ./py/test.mask2descriptor.py				   <- called by script.intensity.sh, used to get the descriptors
+
 ./py/test.covd_2dProjection.py				   <- called by covd2umap.sh, used to get the umap projection for a collection of descriptors
 
 To run the pipeline, make sure that the raw svs files and the polygon data are located in a directory with the same structure as the original one:
