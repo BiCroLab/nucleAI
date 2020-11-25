@@ -39,7 +39,10 @@ Also, make sure that the anaconda folder is located as expected in the script.in
 
 Then open the scripts.sh file and edit the type of cancer that you want to process (BRCA, LUAD, etc.). Save and exit.
 
-Then run "bash scripts.sh"
+Then run 
+```bash
+bash scripts.sh
+```
 
 The data folder will contain the output for both morphological features and covariance descriptors.
 
