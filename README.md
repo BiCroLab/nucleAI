@@ -25,11 +25,10 @@ List of main scripts:
 ./py/test.covd_2dProjection.py				   <- called by covd2umap.sh, used to get the umap projection for a collection of descriptors
 ```
 To run the pipeline, make sure that the raw svs files and the polygon data are located in a directory with the same structure as the original one:
-
+```bash
 /media/garner1/hdd2/svs_BRCA   <- example dirpath to BRCA svs samples, with subdirectory per each sample
-
 /media/garner1/hdd2/TCGA_polygons/BRCA/TCGA-05-4245-01Z-00-DX1...svs.tar.gz <- example dirpath to single BRCA sample polygon file
-
+```
 Also, make sure that the anaconda folder is located as expected in the script.intensity.sh (open the script and check where it has been hard-coded)
 
 Then open the scripts.sh file and edit the type of cancer that you want to process (BRCA, LUAD, etc.). Save and exit.
