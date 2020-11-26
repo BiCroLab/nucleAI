@@ -15,6 +15,8 @@ Project Organization
 ├── notebooks		<- jupyter notebooks used in this project
 └── py			<- python scripts used in this project
 ```
+The requirements.txt file list the working environment used when the pipeline was run, though not all packages listed in the file might be necessary. 
+
 List of main scripts:
 ```bash
 ./scripts.sh		<- used to generate features and descriptors for a given cancer type
@@ -41,3 +43,7 @@ bash scripts.sh
 The data folder will contain the output for both morphological features and covariance descriptors.
 
 To get the UMAP representation of the descriptors see the content of covd2umap.sh to have examples for different cancer types, or to get the global TCGA projection. 
+At the moment of writing these notes a bug seems to affet the umap-learn library when run on numbers of samples exceeding few towsand elements: https://github.com/lmcinnes/umap/issues/496
+
+The UMAP projection still works when run on individual cancer-types.
+
